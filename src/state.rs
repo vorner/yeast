@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Add;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use either::Either;
-use itertools::{EitherOrBoth, Itertools};
+use itertools::{iproduct, EitherOrBoth, Itertools};
 use rand::Rng;
-use rand::distributions::Distribution;
+use rand::distributions::{Distribution, Normal, Uniform};
+use rand::distributions::uniform::SampleUniform;
+use serde::{Deserialize, Serialize};
 
 /// What we measure amounts in.
 ///
@@ -19,7 +21,8 @@ pub const DIMENSIONS: usize = 2;
 pub type Move = [i8; DIMENSIONS];
 
 // TODO: Make this into a Simd?
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(transparent)]
 pub struct Coords([Coord; DIMENSIONS]);
 
 impl Add<Move> for Coords {
@@ -35,25 +38,47 @@ impl Add<Move> for Coords {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Player(u16);
+struct CoordDist<D>(D);
 
-#[derive(Debug)]
-pub struct Food(Mass);
+impl<D> Distribution<Coords> for CoordDist<D>
+where
+    D: Distribution<Coord>,
+{
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Coords {
+        let mut res: [Coord; DIMENSIONS] = Default::default();
+        for c in &mut res {
+            *c = self.0.sample(rng);
+        }
+        Coords(res)
+    }
+}
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Hash)]
+#[serde(transparent)]
+pub struct Player(pub(crate) u16);
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Food {
+    mass: Mass,
+}
+
+#[derive(Copy, Clone, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Cell {
     mass: Mass,
     owner: Player,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case", untagged)]
 pub enum Field {
     Food(Food),
     Cell(Cell),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct StateField {
     position: Coords,
     field: Field,
@@ -68,6 +93,8 @@ impl StateField {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct State {
     fields: Vec<StateField>,
 }
@@ -81,6 +108,8 @@ impl State {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "action")]
 pub enum Action {
     Move {
         direction: Move,
@@ -105,10 +134,17 @@ impl Action {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Command {
+    pub field: Coords,
+    #[serde(flatten)]
+    pub action: Action,
+}
+
 pub struct PlayerAction {
-    field: Coords,
-    player: Player,
-    action: Action,
+    pub(crate) player: Player,
+    pub(crate) command: Command,
 }
 
 trait Dist<T>: Send + Sync {
@@ -126,9 +162,26 @@ where
 
 type MassDist = Box<Dist<Mass>>;
 
+/// Makes sure the returned values are positive.
+struct Correct<D>(D);
+
+impl<D> Distribution<Mass> for Correct<D>
+where
+    D: Distribution<Mass>
+{
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Mass {
+        loop {
+            let attempt = self.0.sample(rng);
+            if attempt > 0.0 {
+                return attempt;
+            }
+        }
+    }
+}
+
 pub struct Rules {
     start_cell_cnt: usize,
-    start_food_cnt: Box<Dist<usize>>,
+    start_food_cnt: usize,
     round_food_cnt: Box<Dist<usize>>,
     area: Box<Dist<Coords>>,
     food_weight: MassDist,
@@ -139,8 +192,51 @@ pub struct Rules {
     reproduce_cost: MassDist,
 }
 
+impl Rules {
+    fn generate() -> Self {
+        fn rng<T: SampleUniform>(low: T, high: T) -> T {
+            Uniform::new_inclusive(low, high).sample(&mut rand::thread_rng())
+        }
+        fn mass(mean_low: Mass, mean_high: Mass, dev_low: Mass, dev_high: Mass) -> MassDist {
+            let mean = rng(mean_low, mean_high);
+            let dev = rng(dev_low, dev_high);
+            let dist = Normal::new(mean, dev);
+            Box::new(Correct(dist))
+        }
+        // TODO: The values here definitely need tuning. And probably reading from config file too!
+        let food_low = rng(30, 50);
+        let food_rnd = rng(15, 30);
+        let area_size: Coord = rng(300, 600);
+        Self {
+            start_cell_cnt: rng(50, 201),
+            start_food_cnt: rng(200, 500),
+            round_food_cnt: Box::new(Uniform::new_inclusive(food_low, food_low + food_rnd)),
+            area: Box::new(CoordDist(Uniform::new_inclusive(-area_size, area_size))),
+            food_weight: mass(20.0, 30.0, 3.0, 8.0),
+            cell_weight: mass(100.0, 120.0, 16.0, 24.0),
+            burst_limit: mass(500.0, 550.0, 10.0, 20.0),
+            move_cost: mass(1.0, 3.0, 0.3, 1.0),
+            rest_cost: mass(0.1, 1.0, 0.1, 0.5),
+            reproduce_cost: mass(20.0, 50.0, 10.0, 20.0),
+        }
+    }
+
+    fn new_food(&self, cnt: usize) -> impl Iterator<Item = StateField> {
+        iter::repeat_with(|| StateField {
+                field: Field::Food(Food {
+                    mass: self.food_weight.gen(),
+                }),
+                position: self.area.gen(),
+            })
+            .take(cnt)
+            .sorted_by_key(|f| f.position)
+    }
+}
+
+pub(crate) struct StillPlaying;
+
 pub struct GameState {
-    rules: Arc<Rules>,
+    rules: Rc<Rules>,
     round: usize,
     state: State,
 }
@@ -184,15 +280,6 @@ impl GameState {
         }
     }
 
-    fn new_food(&self) -> impl Iterator<Item = StateField> {
-        iter::repeat_with(|| StateField {
-                field: Field::Food(Food(self.rules.food_weight.gen())),
-                position: self.rules.area.gen(),
-            })
-            .take(self.rules.round_food_cnt.gen())
-            .sorted_by_key(|f| f.position)
-    }
-
     fn valid_actions<A: IntoIterator<Item = PlayerAction>>(&self, actions: A) -> impl IntoIterator<Item = PlayerAction> {
         let ownership = self
             .state
@@ -206,18 +293,18 @@ impl GameState {
 
         let mut actions = actions
             .into_iter()
-            .filter(|pa| pa.action.valid())
-            .filter(|PlayerAction { field, player, .. }| ownership.get(field) == Some(player))
-            .sorted_by_key(|a| a.field)
+            .filter(|pa| pa.command.action.valid())
+            .filter(|PlayerAction { command, player }| ownership.get(&command.field) == Some(player))
+            .sorted_by_key(|a| a.command.field)
             .collect_vec();
-        actions.dedup_by_key(|a| a.field);
+        actions.dedup_by_key(|a| a.command.field);
         actions
     }
 
     fn check_burst(&self, field: StateField) -> StateField {
         match field.field {
             Field::Cell(Cell { mass, .. }) if mass > self.rules.burst_limit.gen() => StateField {
-                field: Field::Food(Food(mass)),
+                field: Field::Food(Food { mass }),
                 ..field
             },
             _ => field,
@@ -225,13 +312,13 @@ impl GameState {
     }
 
     #[allow(clippy::float_cmp)] // We are actually OK with the comparison ending up randomly
-    fn consolidate<F: IntoIterator<Item = StateField>>(&self, pos: Coords, field: F) -> StateField {
+    fn consolidate<F: IntoIterator<Item = StateField>>(pos: Coords, field: F) -> StateField {
         let mut total_mass = 0.0;
         let mut best_cell = 0.0;
         let mut best_owner = None;
         for content in field {
             match content.field {
-                Field::Food(Food(mass)) => total_mass += mass,
+                Field::Food(Food { mass }) => total_mass += mass,
                 Field::Cell(Cell { mass, owner }) => {
                     if mass > best_cell || (mass == best_cell && rand::thread_rng().gen()) {
                         best_cell = mass;
@@ -247,7 +334,7 @@ impl GameState {
                 mass: total_mass,
                 owner,
             }),
-            None => Field::Food(Food(total_mass)),
+            None => Field::Food(Food { mass: total_mass }),
         };
 
         StateField {
@@ -256,7 +343,7 @@ impl GameState {
         }
     }
 
-    fn round<A: IntoIterator<Item = PlayerAction>>(&self, actions: A) -> GameState {
+    pub(crate) fn round<A: IntoIterator<Item = PlayerAction>>(&self, actions: A) -> GameState {
         self.state.sanity_check();
 
         let actions = self.valid_actions(actions);
@@ -265,18 +352,21 @@ impl GameState {
             .state
             .fields
             .iter()
-            .merge_join_by(actions, |s, a| s.position.cmp(&a.field))
+            .merge_join_by(actions, |s, a| s.position.cmp(&a.command.field))
             .flat_map(|position| match position {
                 EitherOrBoth::Left(f) => Either::Left(self.field_action(f, Action::Rest)),
                 // Command to non-existing field → ignore
                 EitherOrBoth::Right(_) => Either::Right(iter::empty()),
-                EitherOrBoth::Both(f, a) => Either::Left(self.field_action(f, a.action)),
+                EitherOrBoth::Both(f, a) => Either::Left(self.field_action(f, a.command.action)),
             })
             .filter(|a| !a.starved())
-            .merge_by(self.new_food(), |a, b| a.position <= b.position)
+            .merge_by(
+                self.rules.new_food(self.rules.round_food_cnt.gen()),
+                |a, b| a.position <= b.position,
+            )
             .group_by(|f| f.position)
             .into_iter()
-            .map(|(pos, f)| self.consolidate(pos, f))
+            .map(|(pos, f)| Self::consolidate(pos, f))
             .map(|f| self.check_burst(f))
             .collect();
 
@@ -284,9 +374,78 @@ impl GameState {
         state.sanity_check();
 
         GameState {
-            rules: Arc::clone(&self.rules),
+            rules: Rc::clone(&self.rules),
             round: self.round + 1,
             state,
+        }
+    }
+
+    pub(crate) fn state(&self) -> &State {
+        &self.state
+    }
+
+    pub(crate) fn start<P: IntoIterator<Item = Player>>(players: P) -> GameState {
+        let rules = Rules::generate();
+        let mut fields = rules
+            .new_food(rules.start_food_cnt)
+            .group_by(|f| f.position)
+            .into_iter()
+            .map(|(pos, f)| Self::consolidate(pos, f))
+            .collect_vec();
+        let mut taken = fields
+            .iter()
+            .map(|f| f.position)
+            .collect::<HashSet<_>>();
+
+        let players = players.into_iter().collect_vec();
+        for (_, &owner) in iproduct!(0..rules.start_cell_cnt, &players) {
+            // Take the first yet unused field
+            // FIXME: Make sure we don't cycle here, that there are some free spots left.
+            let position = iter::repeat_with(|| rules.area.gen())
+                .filter(|coords| !taken.contains(coords))
+                .nth(0)
+                .unwrap();
+            taken.insert(position);
+            let mass = rules.cell_weight.gen();
+            fields.push(StateField {
+                position,
+                field: Field::Cell(Cell{
+                    mass,
+                    owner,
+                }),
+            });
+        }
+        fields.sort_by_key(|f| f.position);
+        let me = Self {
+            rules: Rc::new(rules),
+            round: 1,
+            state: State {
+                fields,
+            },
+        };
+        me.state.sanity_check();
+        me
+    }
+
+    pub(crate) fn current_round(&self) -> usize {
+        self.round
+    }
+
+    pub(crate) fn winner(&self) -> Result<Option<Player>, StillPlaying> {
+        let alive = self
+            .state
+            .fields
+            .iter()
+            .filter_map(|f| match f.field {
+                Field::Cell(Cell { owner, .. }) => Some(owner),
+                _ => None,
+            })
+            .dedup()
+            .collect_vec();
+        if alive.len() <= 1 {
+            Ok(alive.get(0).cloned())
+        } else {
+            Err(StillPlaying)
         }
     }
 }
