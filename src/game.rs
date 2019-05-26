@@ -126,6 +126,7 @@ impl Game {
             generation: self.game_state.generation + 1,
             serialized,
         });
+        debug!("Notifying game generation {}", self.game_state.generation);
         self.notify_all();
     }
 
@@ -137,6 +138,7 @@ impl Game {
     }
 
     fn notify_all(&mut self) {
+        debug!("Notify all");
         let wakers = self
             .wakers
             .drain(..)

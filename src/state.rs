@@ -57,7 +57,7 @@ where
 #[serde(transparent)]
 pub struct Player(pub(crate) u16);
 
-#[derive(Debug, Serialize)]
+#[derive(Copy, Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Food {
     mass: Mass,
@@ -70,17 +70,18 @@ pub struct Cell {
     owner: Player,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Copy, Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case", untagged)]
 pub enum Field {
     Food(Food),
     Cell(Cell),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Copy, Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct StateField {
     position: Coords,
+    #[serde(flatten)]
     field: Field,
 }
 
@@ -245,7 +246,7 @@ impl GameState {
     fn field_action(&self, field: &StateField, action: Action) -> impl Iterator<Item = StateField> {
         let cell = match &field.field {
             Field::Cell(cell) => cell,
-            _ => unreachable!(),
+            Field::Food(_) => return Either::Left(iter::once(*field)),
         };
 
         match action {

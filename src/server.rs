@@ -70,6 +70,7 @@ fn send_updates<W: Write>(game: PGame, mut w: W) -> Result<(), Error> {
         let gen = state.generation();
         if last_gen != Some(gen) {
             last_gen = Some(gen);
+            debug!("Sending update {} to player", gen);
             writeln!(w, "{}", state.serialized())?;
             w.flush()?;
         }
@@ -110,6 +111,7 @@ where
         let line = line?;
         let cmd = serde_json::from_str::<Commands>(&line)?;
         drop(line);
+        debug!("Received {:?} from {:?}", cmd, player);
         game.borrow_mut().submit(cmd.round, player, cmd.commands);
     }
 
